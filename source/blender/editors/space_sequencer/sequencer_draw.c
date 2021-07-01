@@ -228,9 +228,81 @@ void color3ubv_from_seq(Scene *curscene, Sequence *seq, uchar col[3])
   }
 }
 
+typedef struct WaveVizData {
+  float pos[2];
+  float rms_pos;
+  bool clip;
+  bool end;
+} WaveVizData;
+
+static int get_section_len(WaveVizData *start, WaveVizData *end)
+{
+  int len = 0;
+  while (start != end) {
+    len++;
+    if (start->end) {
+      return len;
+    }
+    start++;
+  }
+  return len;
+}
+
+static void draw_waveform(WaveVizData *iter, WaveVizData *end, GPUPrimType prim_type, bool use_rms)
+{
+  int strip_len = get_section_len(iter, end);
+  if (strip_len != 0) {
+    GPU_blend(GPU_BLEND_ALPHA);
+    GPUVertFormat *format = immVertexFormat();
+    uint pos = GPU_vertformat_attr_add(format, "pos", GPU_COMP_F32, 2, GPU_FETCH_FLOAT);
+    uint col = GPU_vertformat_attr_add(format, "color", GPU_COMP_F32, 4, GPU_FETCH_FLOAT);
+
+    immBindBuiltinProgram(GPU_SHADER_2D_FLAT_COLOR);
+    immBegin(prim_type, strip_len);
+
+    while (iter != end) {
+      if (iter->clip) {
+        immAttr4f(col, 1.0f, 0.0f, 0.0f, 0.5f);
+      }
+      else if (use_rms) {
+        immAttr4f(col, 1.0f, 1.0f, 1.0f, 0.8f);
+      }
+      else {
+        immAttr4f(col, 1.0f, 1.0f, 1.0f, 0.5f);
+      }
+
+      if (use_rms) {
+        immVertex2f(pos, iter->pos[0], iter->rms_pos);
+      }
+      else {
+        immVertex2f(pos, iter->pos[0], iter->pos[1]);
+      }
+
+      if (iter->end) {
+        /* End of line. */
+        iter++;
+        strip_len = get_section_len(iter, end);
+        if (strip_len != 0) {
+          immEnd();
+          immUnbindProgram();
+          immBindBuiltinProgram(GPU_SHADER_2D_FLAT_COLOR);
+          immBegin(prim_type, strip_len);
+        }
+      }
+      else {
+        iter++;
+      }
+    }
+    immEnd();
+    immUnbindProgram();
+
+    GPU_blend(GPU_BLEND_NONE);
+  }
+}
+
 /**
  * \param x1, x2, y1, y2: The starting and end X value to draw the wave, same for y1 and y2.
- * \param stepsize: The width of a pixel.
+ * \param pixels_per_frame: The amount of pixels a whole frame takes up (x-axis direction).
  */
 static void draw_seq_waveform_overlay(View2D *v2d,
                                       const bContext *C,
@@ -241,29 +313,25 @@ static void draw_seq_waveform_overlay(View2D *v2d,
                                       float y1,
                                       float x2,
                                       float y2,
-                                      float stepsize)
+                                      float pixels_per_frame)
 {
   /* Offset x1 and x2 values, to match view min/max, if strip is out of bounds. */
-  int x1_offset = max_ff(v2d->cur.xmin, x1);
-  int x2_offset = min_ff(v2d->cur.xmax + 1.0f, x2);
+  float x1_offset = max_ff(v2d->cur.xmin, x1);
+  float x2_offset = min_ff(v2d->cur.xmax + 1.0f, x2);
 
   if (seq->sound && ((sseq->flag & SEQ_ALL_WAVEFORMS) || (seq->flag & SEQ_AUDIO_DRAW_WAVEFORM))) {
-    int length = floor((x2_offset - x1_offset) / stepsize) + 1;
-    float ymid = (y1 + y2) / 2.0f;
-    float yscale = (y2 - y1) / 2.0f;
-    float samplestep;
-    float startsample, endsample;
-    float volume = seq->volume;
-    float value1, value2;
-    bSound *sound = seq->sound;
-    SoundWaveform *waveform;
+    /* Calculate how long the strip that is in view is in pixels. */
+    int pix_strip_len = floor((x2_offset - x1_offset) * pixels_per_frame);
 
-    if (length < 2) {
+    if (pix_strip_len < 2) {
       return;
     }
 
+    bSound *sound = seq->sound;
+
     BLI_spin_lock(sound->spinlock);
     if (!sound->waveform) {
+      /* Load the waveform data if it hasn't been loaded and cached already. */
       if (!(sound->tags & SOUND_TAGS_WAVEFORM_LOADING)) {
         /* Prevent sounds from reloading. */
         sound->tags |= SOUND_TAGS_WAVEFORM_LOADING;
@@ -277,89 +345,182 @@ static void draw_seq_waveform_overlay(View2D *v2d,
     }
     BLI_spin_unlock(sound->spinlock);
 
-    waveform = sound->waveform;
+    SoundWaveform *waveform = sound->waveform;
 
     /* Waveform could not be built. */
     if (waveform->length == 0) {
       return;
     }
 
-    startsample = (seq->startofs + seq->anim_startofs) / FPS * SOUND_WAVE_SAMPLES_PER_SECOND;
-    startsample += seq->sound->offset_time * SOUND_WAVE_SAMPLES_PER_SECOND;
-
-    endsample = (seq->enddisp - seq->startdisp) / FPS * SOUND_WAVE_SAMPLES_PER_SECOND;
-    endsample += startsample;
-
-    samplestep = (endsample - startsample) * stepsize / (x2 - x1);
-
-    length = min_ii(
-        floor((waveform->length - startsample) / samplestep - (x1_offset - x1) / stepsize),
-        length);
-
-    if (length < 2) {
-      return;
-    }
-
     /* F-curve lookup is quite expensive, so do this after precondition. */
     FCurve *fcu = id_data_find_fcurve(&scene->id, seq, &RNA_Sequence, "volume", 0, NULL);
 
-    GPU_blend(GPU_BLEND_ALPHA);
-    GPUVertFormat *format = immVertexFormat();
-    uint pos = GPU_vertformat_attr_add(format, "pos", GPU_COMP_F32, 2, GPU_FETCH_FLOAT);
-    uint col = GPU_vertformat_attr_add(format, "color", GPU_COMP_F32, 4, GPU_FETCH_FLOAT);
-    immBindBuiltinProgram(GPU_SHADER_2D_FLAT_COLOR);
-    immBegin(GPU_PRIM_TRI_STRIP, length * 2);
+    WaveVizData *tri_strip_arr = MEM_callocN(sizeof(*tri_strip_arr) * pix_strip_len * 2,
+                                             "tri_strip");
+    WaveVizData *line_strip_arr = MEM_callocN(sizeof(*line_strip_arr) * pix_strip_len,
+                                              "line_strip");
 
-    for (int i = 0; i < length; i++) {
-      float sampleoffset = startsample + ((x1_offset - x1) / stepsize + i) * samplestep;
-      int p = sampleoffset;
+    WaveVizData *tri_strip_iter = tri_strip_arr;
+    WaveVizData *line_strip_iter = line_strip_arr;
 
-      value1 = waveform->data[p * 3];
-      value2 = waveform->data[p * 3 + 1];
+    /* The y coordinate for the middle of the strip. */
+    float y_mid = (y1 + y2) / 2.0f;
+    /* The lenght from the middle of the strip to the top/bottom. */
+    float y_scale = (y2 - y1) / 2.0f;
+    float volume = seq->volume;
 
-      if (samplestep > 1.0f) {
-        for (int j = p + 1; (j < waveform->length) && (j < p + samplestep); j++) {
-          if (value1 > waveform->data[j * 3]) {
-            value1 = waveform->data[j * 3];
-          }
+    /* Value to keep track if the previous item to be drawn was a line strip. */
+    int8_t was_line_strip = -1; /* -1 == no previous value. */
 
-          if (value2 < waveform->data[j * 3 + 1]) {
-            value2 = waveform->data[j * 3 + 1];
-          }
-        }
-      }
-      else if (p + 1 < waveform->length) {
+    float samples_per_frame = SOUND_WAVE_SAMPLES_PER_SECOND / FPS;
+
+    /* How many samples do we have for each is each pixel? */
+    float samples_per_pix = samples_per_frame / pixels_per_frame;
+
+    float start_sample = (seq->startofs + seq->anim_startofs) * samples_per_frame;
+    start_sample += seq->sound->offset_time * SOUND_WAVE_SAMPLES_PER_SECOND;
+    /* If we scrolled the start off-screen, then the start sample should be at the first visible
+     * sample. */
+    start_sample += (x1_offset - x1) * samples_per_frame;
+
+    printf("pix_strip_len: %d, waveform_len:%d\n", pix_strip_len, waveform->length);
+    printf("samples_per_pix: %f\n", samples_per_pix);
+    printf("pix per frame: %f\n", pixels_per_frame);
+
+    for (int i = 0; i < pix_strip_len; i++) {
+      float sample_offset = start_sample + i * samples_per_pix;
+      int p = sample_offset;
+
+      float value_min = waveform->data[p * 3];
+      float value_max = waveform->data[p * 3 + 1];
+      float rms = waveform->data[p * 3 + 2];
+
+      if (p + 1 < waveform->length) {
         /* Use simple linear interpolation. */
-        float f = sampleoffset - p;
-        value1 = (1.0f - f) * value1 + f * waveform->data[p * 3 + 3];
-        value2 = (1.0f - f) * value2 + f * waveform->data[p * 3 + 4];
+        float f = sample_offset - p;
+        value_min = (1.0f - f) * value_min + f * waveform->data[p * 3 + 3];
+        value_max = (1.0f - f) * value_max + f * waveform->data[p * 3 + 4];
+        rms = (1.0f - f) * rms + f * waveform->data[p * 3 + 5];
+        if (samples_per_pix > 1.0f) {
+          /* We need to sum up the values we skip over until the next step. */
+          float next_pos = sample_offset + samples_per_pix;
+          int end_idx = next_pos;
+
+          for (int j = p + 1; (j < waveform->length) && (j < end_idx); j++) {
+            // printf("happ\n");
+            value_min = min_ff(value_min, waveform->data[j * 3]);
+            value_max = max_ff(value_max, waveform->data[j * 3 + 1]);
+            rms = max_ff(rms, waveform->data[j * 3 + 2]);
+          }
+
+          // if (end_idx + 1 < waveform->length) {
+          //  float
+          //  value_max = max_ff(value_max, waveform->data[end_idx * 3]);
+          //}
+        }
       }
 
       if (fcu && !BKE_fcurve_is_empty(fcu)) {
-        float evaltime = x1_offset + (i * stepsize);
+        float evaltime = x1_offset + (i / pixels_per_frame);
         volume = evaluate_fcurve(fcu, evaltime);
         CLAMP_MIN(volume, 0.0f);
       }
-      value1 *= volume;
-      value2 *= volume;
 
-      if (value2 > 1 || value1 < -1) {
-        immAttr4f(col, 1.0f, 0.0f, 0.0f, 0.5f);
+      value_min *= volume;
+      value_max *= volume;
+      rms *= volume;
 
-        CLAMP_MAX(value2, 1.0f);
-        CLAMP_MIN(value1, -1.0f);
+      bool clipping = false;
+
+      if (value_max > 1 || value_min < -1) {
+        clipping = true;
+
+        CLAMP_MAX(value_max, 1.0f);
+        CLAMP_MIN(value_min, -1.0f);
+      }
+
+      bool is_line_strip = (value_max - value_min < 0.05f);
+
+      if (was_line_strip != -1 && is_line_strip != was_line_strip) {
+        /* If the previously added strip type isn't the same as the current one,
+         * add transision areas so they transistion smoothly between each other.
+         */
+        if (is_line_strip) {
+          /* This will be a line strip, end the tri strip. */
+          tri_strip_iter->pos[0] = x1_offset + i / pixels_per_frame;
+          tri_strip_iter->pos[1] = y_mid + value_min * y_scale;
+          tri_strip_iter->clip = clipping;
+          tri_strip_iter->rms_pos = tri_strip_iter->pos[1];
+          tri_strip_iter->end = true;
+
+          /* End of section. */
+          tri_strip_iter++;
+
+          /* Check if we are at the end.
+           * If so, skip one point line. */
+          if (i + 1 == pix_strip_len) {
+            continue;
+          }
+        }
+        else {
+          /* This will be a tri strip. */
+          line_strip_iter--;
+          tri_strip_iter->pos[0] = line_strip_iter->pos[0];
+          tri_strip_iter->pos[1] = line_strip_iter->pos[1];
+          tri_strip_iter->clip = line_strip_iter->clip;
+          tri_strip_iter->rms_pos = line_strip_iter->pos[1];
+          tri_strip_iter++;
+
+          /* Check if line had only one point. */
+          line_strip_iter--;
+          if (line_strip_iter < line_strip_arr || line_strip_iter->end) {
+            /* Only one point, skip it. */
+            line_strip_iter++;
+          }
+          else {
+            /* End of section. */
+            line_strip_iter++;
+            line_strip_iter->end = true;
+            line_strip_iter++;
+          }
+        }
+      }
+
+      was_line_strip = is_line_strip;
+
+      if (is_line_strip) {
+        line_strip_iter->pos[0] = x1_offset + i / pixels_per_frame;
+        line_strip_iter->pos[1] = y_mid + value_min * y_scale;
+        line_strip_iter->clip = clipping;
+        line_strip_iter++;
       }
       else {
-        immAttr4f(col, 1.0f, 1.0f, 1.0f, 0.5f);
-      }
+        tri_strip_iter->pos[0] = x1_offset + i / pixels_per_frame;
+        tri_strip_iter->pos[1] = y_mid + value_min * y_scale;
+        tri_strip_iter->clip = clipping;
+        tri_strip_iter->rms_pos = y_mid + max_ff(-rms, value_min) * y_scale;
+        tri_strip_iter++;
 
-      immVertex2f(pos, x1_offset + i * stepsize, ymid + value1 * yscale);
-      immVertex2f(pos, x1_offset + i * stepsize, ymid + value2 * yscale);
+        tri_strip_iter->pos[0] = x1_offset + i / pixels_per_frame;
+        tri_strip_iter->pos[1] = y_mid + value_max * y_scale;
+        tri_strip_iter->clip = clipping;
+        tri_strip_iter->rms_pos = y_mid + min_ff(rms, value_max) * y_scale;
+        tri_strip_iter++;
+      }
     }
 
-    immEnd();
-    immUnbindProgram();
-    GPU_blend(GPU_BLEND_NONE);
+    WaveVizData *tri_strip_end = tri_strip_iter;
+    WaveVizData *line_strip_end = line_strip_iter;
+
+    tri_strip_iter = tri_strip_arr;
+    line_strip_iter = line_strip_arr;
+
+    draw_waveform(line_strip_iter, line_strip_end, GPU_PRIM_LINE_STRIP, false);
+    draw_waveform(tri_strip_iter, tri_strip_end, GPU_PRIM_TRI_STRIP, false);
+    draw_waveform(tri_strip_iter, tri_strip_end, GPU_PRIM_TRI_STRIP, true);
+
+    MEM_freeN(tri_strip_arr);
+    MEM_freeN(line_strip_arr);
   }
 }
 
@@ -1127,7 +1288,7 @@ static void draw_seq_strip(const bContext *C,
   }
   else {
     text_margin_y = y2;
-    y_threshold = 1;
+    y_threshold = false;
   }
 
   uint pos = GPU_vertformat_attr_add(immVertexFormat(), "pos", GPU_COMP_F32, 2, GPU_FETCH_FLOAT);
@@ -1174,7 +1335,7 @@ static void draw_seq_strip(const bContext *C,
                               y_threshold ? y1 + 0.05f : y1,
                               x2,
                               y_threshold ? text_margin_y : y2,
-                              BLI_rctf_size_x(&region->v2d.cur) / region->winx);
+                              region->winx / BLI_rctf_size_x(&region->v2d.cur));
   }
   /* Draw locked state. */
   if (seq->flag & SEQ_LOCK) {
