@@ -1347,7 +1347,7 @@ typedef struct SequencerToolSettings {
 } SequencerToolSettings;
 
 typedef enum eSeqOverlapMode {
-  SEQ_OVERLAP_OVERWRITE = (1<<0),
+  SEQ_OVERLAP_OVERWRITE = (1 << 0),
 } eSeqOverlapMode;
 
 typedef enum eSeqImageFitMethod {

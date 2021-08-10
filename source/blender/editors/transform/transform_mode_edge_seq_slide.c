@@ -92,7 +92,7 @@ static void headerSeqSlide(TransInfo *t, const float val[2], char str[UI_MAX_DRA
     return;
   }
 
-  ofs += BLI_snprintf_rlen(str + ofs, UI_MAX_DRAW_STR - ofs, TIP_("("), &tvec[0], t->con.text);
+  ofs += BLI_snprintf_rlen(str + ofs, UI_MAX_DRAW_STR - ofs, ", (", &tvec[0], t->con.text);
 
   const wmKeyMapItem *kmi = t->custom.mode.data;
   if (kmi) {
