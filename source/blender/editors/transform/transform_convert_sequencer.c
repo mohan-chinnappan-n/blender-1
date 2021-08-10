@@ -302,7 +302,7 @@ static SeqCollection *extract_standalone_strips(SeqCollection *transformed_strip
   return collection;
 }
 
-/* Query strips positioned after left edge of transformed strips r_boundbox. */
+/* Query strips positioned after left edge of transformed strips boundbox. */
 static SeqCollection *query_right_side_strips(ListBase *seqbase, SeqCollection *transformed_strips)
 {
   int minframe = MAXFRAME;
