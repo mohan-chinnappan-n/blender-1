@@ -472,8 +472,8 @@ static void seq_transform_handle_overwrite_trim(TransInfo *t,
                                                 Sequence *target,
                                                 ePartialOvelapSide overlap_side)
 {
-  SeqCollection *targets = SEQ_collection_create(__func__);
-  SEQ_collection_append_strip(target, targets);
+  SeqCollection *targets = SEQ_query_by_reference(
+      target, seqbase_active_get(t), SEQ_query_strip_effect_chain);
 
   /* Expand collection by adding all target's children, effects and their children. */
   if ((target->type & SEQ_TYPE_EFFECT) != 0) {
@@ -498,14 +498,6 @@ static void seq_transform_handle_overwrite_trim(TransInfo *t,
   }
 
   SEQ_collection_free(targets);
-
-  /* Recalculate all effects influenced by target. */
-  SeqCollection *effects = SEQ_query_by_reference(
-      target, seqbase_active_get(t), SEQ_query_strip_effect_chain);
-  SEQ_ITERATOR_FOREACH (seq, effects) {
-    SEQ_time_update_sequence(t->scene, seq);
-  }
-  SEQ_collection_free(effects);
 }
 
 static void seq_transform_handle_overwrite(TransInfo *t, SeqCollection *transformed_strips)
