@@ -27,7 +27,6 @@
 
 #include "BLI_listbase.h"
 #include "BLI_math.h"
-#include "BLI_rect.h"
 
 #include "BKE_context.h"
 #include "BKE_main.h"
